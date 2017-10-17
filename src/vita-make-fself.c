@@ -2,35 +2,60 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <zlib.h>
 
+#include "vita-export.h"
+#include "sce-elf.h"
+#include "endian-utils.h"
 #include "self.h"
+#include "sha256.h"
 
-void usage(char *argv[]) {
-	fprintf(stderr, "Usage: %s [-s] input.velf output-eboot.bin\n", argv[0] ? argv[0] : "make_fself");
-	fprintf(stderr, "\t-s: Generate a safe eboot.bin. A safe eboot.bin does not have access\n\tto restricted APIs and important parts of the filesystem.\n");
+void usage(const char **argv) {
+	fprintf(stderr, "usage: %s [-s|-ss|-a 0x2XXXXXXXXXXXXXXX] [-c] input.velf output-eboot.bin\n", argv[0] ? argv[0] : "vita-make-fself");
+	fprintf(stderr, "\t-s : Generate a safe eboot.bin. A safe eboot.bin does not have access\n\tto restricted APIs and important parts of the filesystem.\n");
+	fprintf(stderr, "\t-ss: Generate a secret-safe eboot.bin. Do not use this option if you don't know what it does.\n");
+	fprintf(stderr, "\t-a : Authid for more permissions (SceShell: 0x2800000000000001).\n");
+	fprintf(stderr, "\t-c : Enable compression.\n");
 	exit(1);
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, const char **argv) {
 	const char *input_path, *output_path;
 	FILE *fin = NULL;
 	FILE *fout = NULL;
+	uint32_t mod_nid;
 
-	if (argc != 3 && argc != 4)
+	argc--;
+	argv++; // strip first argument
+	if (argc < 2)
 		usage(argv);
 
 	int safe = 0;
-	if (argc == 4) {
-		if (strcmp(argv[1], "-s") == 0)
-			safe = 1;
-		else
-			usage(argv);
+	int compressed = 0;
+	uint64_t authid = 0;
+	while (argc > 2) {
+		if (strcmp(*argv, "-s") == 0) {
+			safe = 2;
+		} else if (strcmp(*argv, "-ss") == 0) {
+			safe = 3;
+		} else if (strcmp(*argv, "-c") == 0) {
+			compressed = 1;
+		} else if (strcmp(*argv, "-a") == 0) {
+			argc--;
+			argv++;
+			
+			if (argc > 2)
+				authid = strtoull(*argv, NULL, 0);
+		}
+		argc--;
+		argv++;
+	}
+	input_path = argv[0];
+	output_path = argv[1];
 
-		input_path = argv[2];
-		output_path = argv[3];
-	} else {
-		input_path = argv[1];
-		output_path = argv[2];
+	if (sha256_32_file(input_path, &mod_nid) != 0) {
+		perror("Cannot generate module NID");
+		goto error;
 	}
 
 	fin = fopen(input_path, "rb");
@@ -58,7 +83,20 @@ int main(int argc, char *argv[]) {
 	fclose(fin);
 	fin = NULL;
 
-	ELF_header *ehdr = (ELF_header*)input;
+	Elf32_Ehdr *ehdr = (Elf32_Ehdr*)input;
+
+	// write module nid
+	if (ehdr->e_type == ET_SCE_EXEC) {
+		Elf32_Phdr *phdr = (Elf32_Phdr*)(input + ehdr->e_phoff);
+		sce_module_info_raw *info = (sce_module_info_raw *)(input + phdr->p_offset + phdr->p_paddr);
+		info->library_nid = htole32(mod_nid);
+	} else if (ehdr->e_type == ET_SCE_RELEXEC) {
+		int seg = ehdr->e_entry >> 30;
+		int off = ehdr->e_entry & 0x3fffffff;
+		Elf32_Phdr *phdr = (Elf32_Phdr*)(input + ehdr->e_phoff + seg * ehdr->e_phentsize);
+		sce_module_info_raw *info = (sce_module_info_raw *)(input + phdr->p_offset + off);
+		info->library_nid = htole32(mod_nid);
+	}
 
 	SCE_header hdr = { 0 };
 	hdr.magic = 0x454353; // "SCE\0"
@@ -72,23 +110,28 @@ int main(int argc, char *argv[]) {
 	hdr.self_offset = 4;
 	hdr.appinfo_offset = 0x80;
 	hdr.elf_offset = sizeof(SCE_header) + sizeof(SCE_appinfo);
-	hdr.phdr_offset = hdr.elf_offset + sizeof(ELF_header);
+	hdr.phdr_offset = hdr.elf_offset + sizeof(Elf32_Ehdr);
+	hdr.phdr_offset = (hdr.phdr_offset + 0xf) & ~0xf; // align
 	// hdr.shdr_offset = ;
-	hdr.section_info_offset = hdr.phdr_offset + sizeof(e_phdr) * ehdr->e_phnum;
+	hdr.section_info_offset = hdr.phdr_offset + sizeof(Elf32_Phdr) * ehdr->e_phnum;
 	hdr.sceversion_offset = hdr.section_info_offset + sizeof(segment_info) * ehdr->e_phnum;
 	hdr.controlinfo_offset = hdr.sceversion_offset + sizeof(SCE_version);
 	hdr.controlinfo_size = sizeof(SCE_controlinfo_5) + sizeof(SCE_controlinfo_6) + sizeof(SCE_controlinfo_7);
-	hdr.self_filesize = hdr.section_info_offset + sizeof(segment_info) * ehdr->e_phnum + sz;
+	hdr.self_filesize = 0;
 
 	uint32_t offset_to_real_elf = HEADER_LEN;
 
 	// SCE_header should be ok
 
 	SCE_appinfo appinfo = { 0 };
-	if (safe)
-		appinfo.authid = 0x2F00000000000002ULL;
-	else
-		appinfo.authid = 0x2F00000000000001ULL;
+	if (authid) {
+		appinfo.authid = authid;
+	} else {
+		if (safe)
+			appinfo.authid = 0x2F00000000000000ULL | safe;
+		else
+			appinfo.authid = 0x2F00000000000001ULL;
+	}
 	appinfo.vendor_id = 0;
 	appinfo.self_type = 8;
 	appinfo.version = 0x1000000000000;
@@ -113,7 +156,7 @@ int main(int argc, char *argv[]) {
 	control_7.common.type = 7;
 	control_7.common.size = sizeof(control_7);
 
-	ELF_header myhdr = { 0 };
+	Elf32_Ehdr myhdr = { 0 };
 	memcpy(myhdr.e_ident, "\177ELF\1\1\1", 8);
 	myhdr.e_type = ehdr->e_type;
 	myhdr.e_machine = 0x28;
@@ -130,18 +173,20 @@ int main(int argc, char *argv[]) {
 		perror("Failed to open output file");
 		goto error;
 	}
-	if (fwrite(&hdr, sizeof(hdr), 1, fout) != 1) {
-		perror("Failed to write SCE header");
-		goto error;
-	}
+
+	fseek(fout, hdr.appinfo_offset, SEEK_SET);
 	if (fwrite(&appinfo, sizeof(appinfo), 1, fout) != 1) {
 		perror("Failed to write appinfo");
 		goto error;
 	}
+
+	fseek(fout, hdr.elf_offset, SEEK_SET);
 	fwrite(&myhdr, sizeof(myhdr), 1, fout);
+
 	// copy elf phdr in same format
+	fseek(fout, hdr.phdr_offset, SEEK_SET);
 	for (int i = 0; i < ehdr->e_phnum; ++i) {
-		e_phdr *phdr = (e_phdr*)(input + ehdr->e_phoff + ehdr->e_phentsize * i);
+		Elf32_Phdr *phdr = (Elf32_Phdr*)(input + ehdr->e_phoff + ehdr->e_phentsize * i);
 		// but fixup alignment, TODO: fix in toolchain
 		if (phdr->p_align > 0x1000)
 			phdr->p_align = 0x1000;
@@ -152,8 +197,10 @@ int main(int argc, char *argv[]) {
 	}
 
 	// convert elf phdr info to segment info that sony loader expects
+	// first round we assume no compression
+	fseek(fout, hdr.section_info_offset, SEEK_SET);
 	for (int i = 0; i < ehdr->e_phnum; ++i) {
-		e_phdr *phdr = (e_phdr*)(input + ehdr->e_phoff + ehdr->e_phentsize * i); // TODO: sanity checks
+		Elf32_Phdr *phdr = (Elf32_Phdr*)(input + ehdr->e_phoff + ehdr->e_phentsize * i); // TODO: sanity checks
 		segment_info sinfo = { 0 };
 		sinfo.offset = offset_to_real_elf + phdr->p_offset;
 		sinfo.length = phdr->p_filesz;
@@ -165,20 +212,65 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
+	fseek(fout, hdr.sceversion_offset, SEEK_SET);
 	if (fwrite(&ver, sizeof(ver), 1, fout) != 1) {
 		perror("Failed to write SCE_version");
 		goto error;
 	}
+
+	fseek(fout, hdr.controlinfo_offset, SEEK_SET);
 	fwrite(&control_5, sizeof(control_5), 1, fout);
 	fwrite(&control_6, sizeof(control_6), 1, fout);
 	fwrite(&control_7, sizeof(control_7), 1, fout);
 
-	fseek(fout, HEADER_LEN, SEEK_SET);
+	if (!compressed) {
+		fseek(fout, HEADER_LEN, SEEK_SET);
+		if (fwrite(input, sz, 1, fout) != 1) {
+			perror("Failed to write a copy of input ELF");
+			goto error;
+		}
+	} else {
+		for (int i = 0; i < ehdr->e_phnum; ++i) {
+			Elf32_Phdr *phdr = (Elf32_Phdr*)(input + ehdr->e_phoff + ehdr->e_phentsize * i); // TODO: sanity checks
+			segment_info sinfo = { 0 };
+			unsigned char *buf = malloc(2 * phdr->p_filesz + 12);
+			sinfo.length = 2 * phdr->p_filesz + 12;
+			if (compress2(buf, (uLongf *)&sinfo.length, (unsigned char *)input + phdr->p_offset, phdr->p_filesz, Z_BEST_COMPRESSION) != Z_OK) {
+				free(buf);
+				perror("compress failed");
+				goto error;
+			}
+			// padding
+			uint64_t pad = ((sinfo.length + 3) & ~3) - sinfo.length;
+			for (int i = 0; i < pad; i++) {
+				buf[pad+sinfo.length] = 0;
+			}
+			sinfo.offset = ftell(fout);
+			sinfo.compression = 2;
+			sinfo.encryption = 2;
+			fseek(fout, hdr.section_info_offset + i * sizeof(segment_info), SEEK_SET);
+			if (fwrite(&sinfo, sizeof(sinfo), 1, fout) != 1) {
+				perror("Failed to write segment info");
+				free(buf);
+				goto error;
+			}
+			fseek(fout, sinfo.offset, SEEK_SET);
+			if (fwrite(buf, sinfo.length, 1, fout) != 1) {
+				perror("Failed to write segment to fself");
+				goto error;
+			}
+			free(buf);
+		}
+	}
 
-	if (fwrite(input, sz, 1, fout) != 1) {
-		perror("Failed to write a copy of input ELF");
+	fseek(fout, 0, SEEK_END);
+	hdr.self_filesize = ftell(fout);
+	fseek(fout, 0, SEEK_SET);
+	if (fwrite(&hdr, sizeof(hdr), 1, fout) != 1) {
+		perror("Failed to write SCE header");
 		goto error;
 	}
+
 
 	fclose(fout);
 

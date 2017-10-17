@@ -10,10 +10,12 @@
 
 #include "vita-elf.h"
 #include "vita-import.h"
+#include "vita-export.h"
 #include "elf-defs.h"
 #include "sce-elf.h"
 #include "elf-utils.h"
 #include "fail-utils.h"
+#include "elf-create-argp.h"
 
 // logging level
 int g_log = 0;
@@ -31,8 +33,8 @@ void print_stubs(vita_elf_stub_t *stubs, int num_stubs)
 
 	for (i = 0; i < num_stubs; i++) {
 		TRACEF(VERBOSE, "  0x%06x (%s):\n", stubs[i].addr, stubs[i].symbol ? stubs[i].symbol->name : "unreferenced stub");
-		TRACEF(VERBOSE, "    Library: %u (%s)\n", stubs[i].library_nid, stubs[i].library ? stubs[i].library->name : "not found");
-		TRACEF(VERBOSE, "    Module : %u (%s)\n", stubs[i].module_nid, stubs[i].module ? stubs[i].module->name : "not found");
+		TRACEF(VERBOSE, "    Flags  : %u\n", stubs[i].module ? stubs[i].module->flags : 0);
+		TRACEF(VERBOSE, "    Library: %u (%s)\n", stubs[i].module_nid, stubs[i].module ? stubs[i].module->name : "not found");
 		TRACEF(VERBOSE, "    NID    : %u (%s)\n", stubs[i].target_nid, stubs[i].target ? stubs[i].target->name : "not found");
 	}
 }
@@ -119,134 +121,65 @@ void list_segments(vita_elf_t *ve)
 #include <sys/sysctl.h>
 #endif
 
-void get_binary_directory(char *out, size_t n)
+static int usage(int argc, char *argv[])
 {
-	char *c;
-	char pathsep = '\0';
-#if defined(_WIN32) && !defined(__CYGWIN__)
-	GetModuleFileName(NULL, out, n);
-	pathsep = '\\';
-#elif defined(__linux__) || defined(__CYGWIN__)
-	readlink("/proc/self/exe", out, n);
-	pathsep = '/';
-#elif defined(__APPLE__)
-	_NSGetExecutablePath(out, (uint32_t *)&n);
-	pathsep = '/';
-#elif defined(__FreeBSD__)
-	int mib[4];
-	mib[0] = CTL_KERN;
-	mib[1] = KERN_PROC;
-	mib[2] = KERN_PROC_PATHNAME;
-	mib[3] = -1;
-	sysctl(mib, 4, out, &n, NULL, 0);
-	pathsep = '/';
-#elif defined(DEFAULT_JSON)
-	#error "Sorry, your platform is not supported with -DDEFAULT_JSON."
-#endif
-	if (pathsep && (c = strrchr(out, pathsep)))
-		*++c = '\0';
-}
-
-// The format is path1:path2:path3 where all pathes are relative to the binary directory
-#ifdef DEFAULT_JSON
-char default_json[] = DEFAULT_JSON;
-#else
-char default_json[] = "";
-#endif
-
-vita_imports_t **load_imports(int argc, char *argv[], int *imports_count)
-{
-	vita_imports_t **imports = NULL;
-	int user_count = argc - 3;
-	int default_count = 0;
-	int loaded = 0;
-	char path[PATH_MAX] = { 0 };
-	int i;
-	char *s;
-	char *saveptr;
-	int count;
-	int base_length;
-
-	for (s = default_json; *s; ++s)
-		if (*s == ':')
-			++default_count;
-	// Only way we get 0 is when default_json is empty
-	if (*default_json)
-		++default_count;
-
-	count = user_count + default_count;
-	imports = calloc(count, sizeof(*imports));
-	if (!imports)
-		goto failure;
-
-	// First, load default imports
-	get_binary_directory(path, sizeof(path));
-	base_length = strlen(path);
-
-	s = strtok_r(default_json, ":", &saveptr);
-	while (s) {
-		strncpy(path + base_length, s, sizeof(path) - base_length - 1);
-		if ((imports[loaded++] = vita_imports_load(path, g_log >= DEBUG)) == NULL)
-			goto failure;
-		s = strtok_r(NULL, ":", &saveptr);
-	}
-
-	// Load imports specified by the user
-	for (i = 0; i < user_count; i++) {
-		if ((imports[loaded++] = vita_imports_load(argv[i + 3], g_log >= DEBUG)) == NULL)
-			goto failure;
-	}
-	*imports_count = count;
-	return imports;
-failure:
-	for (i = 0; i < count; ++i)
-		vita_imports_free(imports[i]);
-	free(imports);
-	return NULL;
+	fprintf(stderr, "usage: %s [-v|vv|vvv] [-n] [-e config.yml] input.elf output.velf\n"
+					"\t-v,-vv,-vvv:    logging verbosity (more v is more verbose)\n"
+					"\t-n         :    allow empty imports\n"
+					"\t-e yml     :    optional config options\n"
+					"\tinput.elf  :    input ARM ET_EXEC type ELF\n"
+					"\toutput.velf:    output ET_SCE_RELEXEC type ELF\n", argc > 0 ? argv[0] : "vita-elf-create");
+	return 0;
 }
 
 int main(int argc, char *argv[])
 {
 	vita_elf_t *ve;
-	vita_imports_t **imports;
 	sce_module_info_t *module_info;
 	sce_section_sizes_t section_sizes;
 	void *encoded_modinfo;
 	vita_elf_rela_table_t rtable = {};
-	int imports_count;
-
+	vita_export_t *exports = NULL;
+	
 	int status = EXIT_SUCCESS;
 
-	if (argc > 1 && argv[1][0] == '-' && argv[1][1] == 'v') {
-		g_log = 1;
-		for (int i = 2; argv[1][i] != '\0'; i++) {
-			switch (argv[1][i]) {
-				case 'v': g_log++; break;
-				default: argc = 0; break; // ensure error in next statement
-			}
-		}
-		argv++;
-		argc--;
+	elf_create_args args = {};
+	if (parse_arguments(argc, argv, &args) < 0) {
+		usage(argc, argv);
+		return EXIT_FAILURE;
 	}
 
-	if (argc < 3)
-		errx(EXIT_FAILURE,"Usage: vita-elf-create [-v|-vv] input-elf output-elf [extra.json ...]");
+	g_log = args.log_level;
 
-	if ((ve = vita_elf_load(argv[1])) == NULL)
+	if ((ve = vita_elf_load(args.input, args.check_stub_count)) == NULL)
 		return EXIT_FAILURE;
 
-	if (!(imports = load_imports(argc, argv, &imports_count)))
-		return EXIT_FAILURE;
+	/* FIXME: save original segment sizes */
+	Elf32_Word *segment_sizes = malloc(ve->num_segments * sizeof(Elf32_Word));
+	int idx;
+	for(idx = 0; idx < ve->num_segments; idx++)
+		segment_sizes[idx] = ve->segments[idx].memsz;
 
-	if (!vita_elf_lookup_imports(ve, imports, imports_count))
+	if (args.exports) {
+		exports = vita_exports_load(args.exports, args.input, 0);
+		
+		if (!exports)
+			return EXIT_FAILURE;
+	}
+	else {
+		// generate a default export list
+		exports = vita_export_generate_default(args.input);
+	}
+
+	if (!vita_elf_lookup_imports(ve))
 		status = EXIT_FAILURE;
 
-	if (ve->fstubs_ndx) {
-		TRACEF(VERBOSE, "Function stubs in section %d:\n", ve->fstubs_ndx);
+	if (ve->fstubs_va.count) {
+		TRACEF(VERBOSE, "Function stubs in sections \n");
 		print_stubs(ve->fstubs, ve->num_fstubs);
 	}
-	if (ve->vstubs_ndx) {
-		TRACEF(VERBOSE, "Variable stubs in section %d:\n", ve->vstubs_ndx);
+	if (ve->vstubs_va.count) {
+		TRACEF(VERBOSE, "Variable stubs in sections \n");
 		print_stubs(ve->vstubs, ve->num_vstubs);
 	}
 
@@ -256,8 +189,11 @@ int main(int argc, char *argv[])
 	TRACEF(VERBOSE, "Segments:\n");
 	list_segments(ve);
 
-	module_info = sce_elf_module_info_create(ve);
+	module_info = sce_elf_module_info_create(ve, exports);
 
+	if (!module_info)
+		return EXIT_FAILURE;
+	
 	int total_size = sce_elf_module_info_get_size(module_info, &section_sizes);
 	int curpos = 0;
 	TRACEF(VERBOSE, "Total SCE data size: %d / %x\n", total_size, total_size);
@@ -272,8 +208,6 @@ int main(int argc, char *argv[])
 	PRINTSEC(sceVNID_rodata);
 	PRINTSEC(sceVStub_rodata);
 
-	strncpy(module_info->name, argv[1], sizeof(module_info->name) - 1);
-
 	encoded_modinfo = sce_elf_module_info_encode(
 			module_info, ve, &section_sizes, &rtable);
 
@@ -282,7 +216,7 @@ int main(int argc, char *argv[])
 
 	FILE *outfile;
 	Elf *dest;
-	ASSERT(dest = elf_utils_copy_to_file(argv[2], ve->elf, &outfile));
+	ASSERT(dest = elf_utils_copy_to_file(args.output, ve->elf, &outfile));
 	ASSERT(elf_utils_duplicate_shstrtab(dest));
 	ASSERT(sce_elf_discard_invalid_relocs(ve, ve->rela_tables));
 	ASSERT(sce_elf_write_module_info(dest, ve, &section_sizes, encoded_modinfo));
@@ -294,16 +228,13 @@ int main(int argc, char *argv[])
 	ASSERT(sce_elf_set_headers(outfile, ve));
 	fclose(outfile);
 
+	/* FIXME: restore original segment sizes */
+	for(idx = 0; idx < ve->num_segments; idx++)
+		ve->segments[idx].memsz = segment_sizes[idx];
+	free(segment_sizes);
 
 	sce_elf_module_info_free(module_info);
 	vita_elf_free(ve);
-
-	int i;
-	for (i = 0; i < imports_count; i++) {
-		vita_imports_free(imports[i]);
-	}
-
-	free(imports);
 
 	return status;
 failure:

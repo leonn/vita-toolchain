@@ -6,6 +6,7 @@
 #include <gelf.h>
 
 #include "vita-elf.h"
+#include "vita-export.h"
 #include "elf-defs.h"
 #include "elf-utils.h"
 #include "sce-elf.h"
@@ -95,27 +96,162 @@ static int _module_search(const void *key, const void *element)
 	return 0;
 }
 
+static int get_function_by_symbol(const char *symbol, vita_elf_t *ve, Elf32_Addr *vaddr) {
+	int i;
+	
+	for (i = 0; i < ve->num_symbols; ++i) {
+		if (ve->symtab[i].type != STT_FUNC)
+			continue;
+		
+		if (strcmp(ve->symtab[i].name, symbol) == 0) {
+			*vaddr = ve->symtab[i].value;
+			break;
+		}
+	}
+	
+	return i != ve->num_symbols;
+}
+
+static int get_variable_by_symbol(const char *symbol, vita_elf_t *ve, Elf32_Addr *vaddr) {
+	int i;
+	
+	for (i = 0; i < ve->num_symbols; ++i) {
+		if (ve->symtab[i].type != STT_OBJECT)
+			continue;
+		
+		if (strcmp(ve->symtab[i].name, symbol) == 0) {
+			*vaddr = ve->symtab[i].value;
+			break;
+		}
+	}
+	
+	return i != ve->num_symbols;
+}
+
 typedef union {
 	import_module *modules;
 	varray va;
 } import_module_list;
 
-static void set_main_module_export(sce_module_exports_t *export, const sce_module_info_t *module_info)
+static int set_module_export(vita_elf_t *ve, sce_module_exports_t *export, vita_library_export *lib)
+{
+	export->size = sizeof(sce_module_exports_raw);
+	export->version = 1;
+	export->flags = lib->syscall ? 0x4001 : 0x0001;
+	export->num_syms_funcs = lib->function_n;
+	export->num_syms_vars = lib->variable_n;
+	export->module_name = strdup(lib->name);
+	export->module_nid = lib->nid; 
+	
+	int total_exports = export->num_syms_funcs + export->num_syms_vars;
+	export->nid_table = calloc(total_exports, sizeof(uint32_t));
+	export->entry_table = calloc(total_exports, sizeof(void*));
+	
+	int cur_ent = 0;
+	int i;
+	for (i = 0; i < export->num_syms_funcs; ++i) {
+		Elf32_Addr vaddr = 0;
+		vita_export_symbol *sym = lib->functions[i];
+		
+		if (!get_function_by_symbol(sym->name, ve, &vaddr)) {
+			FAILX("Could not find function symbol '%s' for export '%s'", sym->name, lib->name);
+		}
+		
+		export->nid_table[cur_ent] = sym->nid;
+		export->entry_table[cur_ent] = vita_elf_vaddr_to_host(ve, vaddr);
+		++cur_ent;
+	}
+	
+	for (i = 0; i < export->num_syms_vars; ++i) {
+		Elf32_Addr vaddr = 0;
+		vita_export_symbol *sym = lib->variables[i];
+		
+		if (!get_variable_by_symbol(sym->name, ve, &vaddr)) {
+			FAILX("Could not find variable symbol '%s' for export '%s'", sym->name, lib->name);
+		}
+		
+		export->nid_table[cur_ent] = sym->nid;
+		export->entry_table[cur_ent] = vita_elf_vaddr_to_host(ve, vaddr);
+		++cur_ent;
+	}
+	
+	return 0;
+	
+failure:
+	return -1;
+}
+
+static int set_main_module_export(vita_elf_t *ve, sce_module_exports_t *export, sce_module_info_t *module_info, vita_export_t *export_spec)
 {
 	export->size = sizeof(sce_module_exports_raw);
 	export->version = 0;
 	export->flags = 0x8000;
 	export->num_syms_funcs = 1;
 	export->num_syms_vars = 2;
+	
+	if (export_spec->stop)
+		++export->num_syms_funcs;
+	
+	if (export_spec->exit)
+		++export->num_syms_funcs;
+	
 	int total_exports = export->num_syms_funcs + export->num_syms_vars;
 	export->nid_table = calloc(total_exports, sizeof(uint32_t));
-	export->nid_table[0] = NID_MODULE_START;
-	export->nid_table[1] = NID_MODULE_INFO;
-	export->nid_table[2] = NID_PROCESS_PARAM;
 	export->entry_table = calloc(total_exports, sizeof(void*));
-	export->entry_table[0] = module_info->module_start;
-	export->entry_table[1] = module_info;
-	export->entry_table[2] = &module_info->process_param_size;
+	
+	int cur_nid = 0;
+	
+	if (export_spec->start) {
+		Elf32_Addr vaddr = 0;
+		if (!get_function_by_symbol(export_spec->start, ve, &vaddr)) {
+			FAILX("Could not find symbol '%s' for main export 'start'", export_spec->start);
+		}
+		
+		module_info->module_start = vita_elf_vaddr_to_host(ve, vaddr);
+	}
+	else
+		module_info->module_start = vita_elf_vaddr_to_host(ve, elf32_getehdr(ve->elf)->e_entry);
+	
+	export->nid_table[cur_nid] = NID_MODULE_START;
+	export->entry_table[cur_nid] = module_info->module_start;
+	++cur_nid;
+	
+	if (export_spec->stop) {
+		Elf32_Addr vaddr = 0;
+		
+		if (!get_function_by_symbol(export_spec->stop, ve, &vaddr)) {
+			FAILX("Could not find symbol '%s' for main export 'stop'", export_spec->stop);
+		}
+		
+		export->nid_table[cur_nid] = NID_MODULE_STOP;
+		export->entry_table[cur_nid] = module_info->module_stop = vita_elf_vaddr_to_host(ve, vaddr);
+		++cur_nid;
+	}
+	
+	if (export_spec->exit) {
+		Elf32_Addr vaddr = 0;
+		
+		if (!get_function_by_symbol(export_spec->exit, ve, &vaddr)) {
+			FAILX("Could not find symbol '%s' for main export 'exit'", export_spec->exit);
+		}
+		
+		export->nid_table[cur_nid] = NID_MODULE_EXIT;
+		export->entry_table[cur_nid] = vita_elf_vaddr_to_host(ve, vaddr);
+		++cur_nid;
+	}
+	
+	export->nid_table[cur_nid] = NID_MODULE_INFO;
+	export->entry_table[cur_nid] = module_info;
+	++cur_nid;
+	
+	export->nid_table[cur_nid] = NID_PROCESS_PARAM;
+	export->entry_table[cur_nid] = &module_info->process_param_size;
+	++cur_nid;
+	
+	return 0;
+	
+failure:
+	return -1;
 }
 
 static void set_module_import(vita_elf_t *ve, sce_module_imports_t *import, const import_module *module)
@@ -127,6 +263,8 @@ static void set_module_import(vita_elf_t *ve, sce_module_imports_t *import, cons
 	import->num_syms_funcs = module->functions_va.count;
 	import->num_syms_vars = module->variables_va.count;
 	import->module_nid = module->nid;
+	import->flags = module->module->flags;
+
 	if (module->module) {
 		import->module_name = module->module->name;
 	}
@@ -146,7 +284,7 @@ static void set_module_import(vita_elf_t *ve, sce_module_imports_t *import, cons
 	}
 }
 
-sce_module_info_t *sce_elf_module_info_create(vita_elf_t *ve)
+sce_module_info_t *sce_elf_module_info_create(vita_elf_t *ve, vita_export_t *exports)
 {
 	int i;
 	sce_module_info_t *module_info;
@@ -158,15 +296,30 @@ sce_module_info_t *sce_elf_module_info_create(vita_elf_t *ve)
 	ASSERT(module_info != NULL);
 
 	module_info->type = 6;
-	module_info->version = 0x0101;
-	module_info->module_start = vita_elf_vaddr_to_host(ve, elf32_getehdr(ve->elf)->e_entry);
-
-	module_info->export_top = calloc(1, sizeof(sce_module_exports_t));
+	module_info->version = (exports->ver_major << 8) | exports->ver_minor;
+	
+	strncpy(module_info->name, exports->name, sizeof(module_info->name) - 1);
+	
+	// allocate memory for all libraries + main
+	module_info->export_top = calloc(exports->module_n + 1, sizeof(sce_module_exports_t));
 	ASSERT(module_info->export_top != NULL);
-	module_info->export_end = module_info->export_top + 1;
+	module_info->export_end = module_info->export_top + exports->module_n + 1;
 
-	set_main_module_export(module_info->export_top, module_info);
+	if (set_main_module_export(ve, module_info->export_top, module_info, exports) < 0) {
+		goto sce_failure;
+	}
 
+	// populate rest of exports
+	for (i = 0; i < exports->module_n; ++i) {
+		vita_library_export *lib = exports->modules[i];
+		sce_module_exports_t *exp = (sce_module_exports_t *)(module_info->export_top + i + 1);
+		
+		// TODO: improve cleanup
+		if (set_module_export(ve, exp, lib) < 0) {
+			goto sce_failure;
+		}
+	}
+	
 	ASSERT(varray_init(&modlist.va, sizeof(import_module), 8));
 	modlist.va.init_func = _module_init;
 	modlist.va.destroy_func = _module_destroy;
@@ -207,6 +360,8 @@ sce_module_info_t *sce_elf_module_info_create(vita_elf_t *ve)
 
 failure:
 	varray_destroy(&modlist.va);
+	
+sce_failure:
 	sce_elf_module_info_free(module_info);
 	return NULL;
 }
@@ -332,6 +487,7 @@ void *sce_elf_module_info_encode(
 
 	segment_base = ve->segments[segndx].vaddr;
 	start_offset = ve->segments[segndx].memsz;
+	start_offset = (start_offset + 0xF) & ~0xF; // align to 16 bytes
 
 	for (i = 0; i < ve->num_segments; i++) {
 		if (i == segndx)
@@ -536,12 +692,13 @@ int sce_elf_write_module_info(
 
 	segment_base = ve->segments[segndx].vaddr;
 	start_segoffset = ve->segments[segndx].memsz;
+	start_segoffset = (start_segoffset + 0xF) & ~0xF; // align to 16 bytes, same with `sce_elf_module_info_encode`
+	total_size += (start_segoffset - ve->segments[segndx].memsz); // add the padding size
 
 	start_vaddr = segment_base + start_segoffset;
 	start_foffset = phdr.p_offset + start_segoffset;
 	cur_pos = 0;
 
-	total_size += 0x10 - (total_size & 0xF);
 	if (!elf_utils_shift_contents(dest, start_foffset, total_size))
 		FAILX("Unable to relocate ELF sections");
 
@@ -555,7 +712,6 @@ int sce_elf_write_module_info(
 	ELF_ASSERT(gelf_getehdr(dest, &ehdr));
 	ehdr.e_entry = ((segndx & 0x3) << 30) | start_segoffset;
 	ELF_ASSERT(gelf_update_ehdr(dest, &ehdr));
-
 
 	for (i = 0; i < sizeof(sce_section_sizes_t) / sizeof(Elf32_Word); i++) {
 		int scn_size = ((Elf32_Word *)sizes)[i];
@@ -774,41 +930,61 @@ int sce_elf_rewrite_stubs(Elf *dest, const vita_elf_t *ve)
 	size_t shstrndx;
 	void *shstrtab;
 	uint32_t *stubdata;
+	int j;
+	int *cur_ndx;
+	char *sh_name, *stub_name;
 
 	ELF_ASSERT(elf_getshdrstrndx(dest, &shstrndx) == 0);
 	ELF_ASSERT(scn = elf_getscn(dest, shstrndx));
 	ELF_ASSERT(data = elf_getdata(scn, NULL));
 	shstrtab = data->d_buf;
 
-	ELF_ASSERT(scn = elf_getscn(dest, ve->fstubs_ndx));
-	ELF_ASSERT(gelf_getshdr(scn, &shdr));
-	strcpy(shstrtab + shdr.sh_name, ".text.fstubs");
-	data = NULL;
-	while ((data = elf_getdata(scn, data)) != NULL) {
-		for (stubdata = (uint32_t *)data->d_buf;
-				(void *)stubdata < data->d_buf + data->d_size - 11; stubdata += 4) {
-			stubdata[0] = htole32(sce_elf_stub_func[0]);
-			stubdata[1] = htole32(sce_elf_stub_func[1]);
-			stubdata[2] = htole32(sce_elf_stub_func[2]);
-			stubdata[3] = 0;
+	for(j=0;j<ve->fstubs_va.count;j++){
+		cur_ndx = VARRAY_ELEMENT(&ve->fstubs_va,j);
+		ELF_ASSERT(scn = elf_getscn(dest, *cur_ndx));
+		ELF_ASSERT(gelf_getshdr(scn, &shdr));
+		
+		sh_name = shstrtab + shdr.sh_name;
+		if (strstr(sh_name, ".vitalink.fstubs.") != sh_name)
+			errx(EXIT_FAILURE, "Your ELF file contains a malformed .vitalink.fstubs section. Please make sure all your stub libraries are up-to-date.");
+		stub_name = strrchr(sh_name, '.');
+		snprintf(sh_name, strlen(sh_name) + 1, ".text.fstubs%s", stub_name);
+		
+		data = NULL;
+		while ((data = elf_getdata(scn, data)) != NULL) {
+			for (stubdata = (uint32_t *)data->d_buf;
+					(void *)stubdata < data->d_buf + data->d_size - 11; stubdata += 4) {
+				stubdata[0] = htole32(sce_elf_stub_func[0]);
+				stubdata[1] = htole32(sce_elf_stub_func[1]);
+				stubdata[2] = htole32(sce_elf_stub_func[2]);
+				stubdata[3] = 0;
+			}
 		}
 	}
 
-	ELF_ASSERT(scn = elf_getscn(dest, ve->vstubs_ndx));
 
 	/* If the section index is zero, it means that it's nonexistent */
-	if (ve->vstubs_ndx == 0) {
+	if (ve->vstubs_va.count == 0) {
 		return 1;
 	}
-
-	ELF_ASSERT(gelf_getshdr(scn, &shdr));
-	strcpy(shstrtab + shdr.sh_name, ".data.vstubs");
-
-	data = NULL;
-	while ((data = elf_getdata(scn, data)) != NULL) {
-		for (stubdata = (uint32_t *)data->d_buf;
-				(void *)stubdata < data->d_buf + data->d_size - 11; stubdata += 4) {
-			memset(stubdata, 0, 16);
+	
+	for(j=0;j<ve->vstubs_va.count;j++){
+		cur_ndx = VARRAY_ELEMENT(&ve->vstubs_va,j);
+		ELF_ASSERT(scn = elf_getscn(dest, *cur_ndx));
+		ELF_ASSERT(gelf_getshdr(scn, &shdr));
+		
+		sh_name = shstrtab + shdr.sh_name;
+		if (strstr(sh_name, ".vitalink.vstubs.") != sh_name)
+			errx(EXIT_FAILURE, "Your ELF file contains a malformed .vitalink.vstubs section. Please make sure all your stub libraries are up-to-date.");
+		stub_name = strrchr(sh_name, '.');
+		snprintf(sh_name, strlen(sh_name) + 1, ".data.vstubs%s", stub_name);
+		
+		data = NULL;
+		while ((data = elf_getdata(scn, data)) != NULL) {
+			for (stubdata = (uint32_t *)data->d_buf;
+					(void *)stubdata < data->d_buf + data->d_size - 11; stubdata += 4) {
+				memset(stubdata, 0, 16);
+			}
 		}
 	}
 
