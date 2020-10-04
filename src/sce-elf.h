@@ -29,6 +29,7 @@
 #define NID_MODULE_STOP		0x79F8E492
 #define NID_MODULE_EXIT		0x913482A9
 #define NID_MODULE_START	0x935CD196
+#define NID_MODULE_BOOTSTART	0x5C424D40
 #define NID_MODULE_INFO		0x6C2224BA
 #define NID_PROCESS_PARAM	0x70FBA1E7
 
@@ -102,7 +103,5 @@ int sce_elf_write_rela_sections(
 int sce_elf_rewrite_stubs(Elf *dest, const vita_elf_t *ve);
 
 int sce_elf_set_headers(FILE *outfile, const vita_elf_t *ve);
-
-const uint32_t sce_elf_stub_func[3];
 
 #endif

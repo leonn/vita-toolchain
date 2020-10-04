@@ -20,53 +20,103 @@ static void print_module_tree(vita_export_t *export)
 			"STOP: %s\n"
 			"EXIT: %s\n"
 			"MODULES: %zd\n"
-			, export->name, export->attributes, export->nid, export->ver_major, export->ver_minor, export->start, export->stop, export->exit, export->module_n);
+			, export->name, export->attributes, export->nid, export->ver_major, export->ver_minor, export->start, export->stop, export->exit, export->lib_n);
 			
-	for (int i = 0; i < export->module_n; ++i) {
+	for (int i = 0; i < export->lib_n; ++i) {
 		printf(	"\tLIBRARY: \"%s\"\n"
 				"\tNID: 0x%08X\n"
 				"\tSYSCALL: %s\n"
 				"\tFUNCTIONS: %zd\n"
-			, export->modules[i]->name, export->modules[i]->nid, export->modules[i]->syscall ? ("true") : ("false"), export->modules[i]->function_n);
+			, export->libs[i]->name, export->libs[i]->nid, export->libs[i]->syscall ? ("true") : ("false"), export->libs[i]->function_n);
 			
-		for (int j = 0; j < export->modules[i]->function_n; ++j) {
+		for (int j = 0; j < export->libs[i]->function_n; ++j) {
 			printf(	"\t\tEXPORT SYMBOL: \"%s\"\n"
 					"\t\tNID: 0x%08X\n"
-					, export->modules[i]->functions[j]->name, export->modules[i]->functions[j]->nid);
+					, export->libs[i]->functions[j]->name, export->libs[i]->functions[j]->nid);
 		}
 		
-		printf("\tVARIABLES: %zd\n", export->modules[i]->variable_n);
+		printf("\tVARIABLES: %zd\n", export->libs[i]->variable_n);
 		
-		for (int j = 0; j < export->modules[i]->variable_n; ++j) {
+		for (int j = 0; j < export->libs[i]->variable_n; ++j) {
 			printf(	"\t\tEXPORT SYMBOL: \"%s\"\n"
 					"\t\tNID: 0x%08X\n"
-					, export->modules[i]->variables[j]->name, export->modules[i]->variables[j]->nid);
+					, export->libs[i]->variables[j]->name, export->libs[i]->variables[j]->nid);
 		}
 	}
 }
 
+uint32_t exported_func_count = 0;
+
 int process_functions(yaml_node *entry, vita_library_export *export) {
-	if (!is_scalar(entry)) {
-		fprintf(stderr, "error: line: %zd, column: %zd, expecting function name to be scalar, got '%s'.\n"
-			, entry->position.line
-			, entry->position.column
-			, node_type_str(entry));
-		
-		return -1;
+	if (is_scalar(entry)) {
+		yaml_scalar *key = &entry->data.scalar;
+
+		// create an export symbol for this function
+		vita_export_symbol *symbol = malloc(sizeof(vita_export_symbol));
+		symbol->name = strdup(key->value);
+
+		// Hacky logic to protect against nid conflicts.
+		char *func_name_for_nid = malloc(key->len + 11);
+		int outlen = snprintf(func_name_for_nid, key->len + 10, "%s_%08X", key->value, exported_func_count++);
+		symbol->nid = sha256_32_vector(1, (uint8_t **)&func_name_for_nid, (size_t *)&outlen);
+		free(func_name_for_nid);
+
+		// append to list
+		export->functions = realloc(export->functions, (export->function_n+1)*sizeof(const char*));
+		export->functions[export->function_n++] = symbol;
+
+		return 0;
 	}
-	
-	yaml_scalar *key = &entry->data.scalar;
-	
-	// create an export symbol for this function
-	vita_export_symbol *symbol = malloc(sizeof(vita_export_symbol));
-	symbol->name = strdup(key->value);
-	symbol->nid = sha256_32_vector(1, (uint8_t **)&key->value, &key->len);
-	
-	// append to list
-	export->functions = realloc(export->functions, (export->function_n+1)*sizeof(const char*));
-	export->functions[export->function_n++] = symbol;
-	
-	return 0;
+
+	if (is_mapping(entry)) {
+		if ((entry->data.mapping.count - 1) != 0) {
+			fprintf(stderr, "error: line: %zd, column: %zd, Invalid reference count : %u\n"
+				, entry->position.line
+				, entry->position.column
+				, entry->data.mapping.count);
+			return -1;
+		}
+
+		if (is_scalar(entry->data.mapping.pairs[0]->lhs) == 0 || is_scalar(entry->data.mapping.pairs[0]->rhs) == 0) {
+
+			fprintf(stderr, "error: line: %zd, column: %zd, expecting function name to be scalar, got '%s'.\n"
+				, entry->position.line
+				, entry->position.column
+				, node_type_str(entry));
+			return -1;
+		}
+
+		// create an export symbol for this function
+		vita_export_symbol *symbol = malloc(sizeof(vita_export_symbol));
+		symbol->name = strdup(entry->data.mapping.pairs[0]->lhs->data.scalar.value);
+
+		if (process_32bit_integer(entry->data.mapping.pairs[0]->rhs, &symbol->nid) < 0) {
+			fprintf(stderr, "error: line: %zd, column: %zd, could not convert function nid '%s' to 32 bit integer.\n"
+				, entry->data.mapping.pairs[0]->rhs->position.line
+				, entry->data.mapping.pairs[0]->rhs->position.column
+				, entry->data.mapping.pairs[0]->rhs->data.scalar.value);
+
+			free((void *)symbol->name);
+			free(symbol);
+
+			return -1;
+		}
+
+		exported_func_count++;
+
+		// append to list
+		export->functions = realloc(export->functions, (export->function_n+1)*sizeof(const char*));
+		export->functions[export->function_n++] = symbol;
+
+		return 0;
+	}
+
+	fprintf(stderr, "error: line: %zd, column: %zd, Unhandled type, got '%s'.\n"
+		, entry->position.line
+		, entry->position.column
+		, node_type_str(entry));
+
+	return -1;
 }
 
 int process_variables(yaml_node *entry, vita_library_export *export) {
@@ -211,8 +261,8 @@ int process_export_list(yaml_node *parent, yaml_node *child, vita_export_t *info
 	if (yaml_iterate_mapping(child, (mapping_functor)process_export, export) < 0)
 		return -1;
 	
-	info->modules = realloc(info->modules, (info->module_n+1)*sizeof(vita_library_export*));
-	info->modules[info->module_n++] = export;
+	info->libs = realloc(info->libs, (info->lib_n+1)*sizeof(vita_library_export*));
+	info->libs[info->lib_n++] = export;
 	return 0;
 }
 
@@ -237,6 +287,19 @@ int process_syslib_list(yaml_node *parent, yaml_node *child, vita_export_t *info
 		}
 		
 		info->start = strdup(str);
+	}
+	else if (strcmp(key->value, "bootstart") == 0) {
+		if (!is_scalar(child)) {
+			fprintf(stderr, "error: line: %zd, column: %zd, expecting 'bootstart' entry-point to be scalar, got '%s'.\n", child->position.line, child->position.column, node_type_str(child));
+			return -1;
+		}
+		const char *str = NULL;
+		if (process_string(child, &str) < 0) {
+			fprintf(stderr, "error: line: %zd, column: %zd, could not convert 'bootstart' entry-point to string, got '%s'.\n", child->position.line, child->position.column, child->data.scalar.value);
+			return -1;
+		}
+		
+		info->bootstart = strdup(str);
 	}
 	else if (strcmp(key->value, "stop") == 0) {
 		if (!is_scalar(child)) {
@@ -457,12 +520,13 @@ vita_export_t *vita_export_generate_default(const char *elf)
 	}
 	
 	// we don't specify any specific symbols
+	exports->bootstart = NULL;
 	exports->start = NULL;
 	exports->stop = NULL;
 	exports->exit = NULL;
 	
 	// we have no libraries to export
-	exports->module_n = 0;
-	exports->modules = NULL;
+	exports->lib_n = 0;
+	exports->libs = NULL;
 	return exports;
 }
